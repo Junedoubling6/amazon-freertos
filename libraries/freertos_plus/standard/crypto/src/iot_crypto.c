@@ -27,6 +27,7 @@
 #include "FreeRTOS.h"
 #include "FreeRTOSIPConfig.h"
 #include "iot_crypto.h"
+#include "iot_pkcs11.h"
 
 /* mbedTLS includes. */
 #include "mbedtls/config.h"
@@ -35,6 +36,8 @@
 #include "mbedtls/sha1.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/x509_crt.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
 /* Threading mutex implementations for mbedTLS. */
 #include "mbedtls/threading.h"
 #include "threading_alt.h"
@@ -240,6 +243,7 @@ void CRYPTO_Init( void )
 {
     CRYPTO_ConfigureHeap();
     CRYPTO_ConfigureThreading();
+    CRYPTO_ConfigureDRBG();
 }
 
 /**
@@ -261,6 +265,141 @@ void CRYPTO_ConfigureThreading( void )
                                aws_mbedtls_mutex_free,
                                aws_mbedtls_mutex_lock,
                                aws_mbedtls_mutex_unlock );
+}
+
+#ifdef pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG
+
+    typedef struct CryptoDRBG_t
+    {
+        CK_BBOOL xIsInitialized;                     /* Indicates whether PKCS #11 module has been initialized with a call to C_Initialize. */
+        mbedtls_ctr_drbg_context xMbedDrbgCtx;       /* CTR-DRBG context for PKCS #11 module - used to generate pseudo-random numbers. */
+        mbedtls_entropy_context xMbedEntropyContext; /* Entropy context for PKCS #11 module - used to collect entropy for RNG. */
+    } CryptoDRBG_t;
+
+    CryptoDRBG_t xDrbg;
+
+#endif /* ifdef pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG */
+
+/**
+ * @brief Create a static PKCS #11 crypto session handle to share across socket
+ * and FreeRTOS+TCP threads. Assume that two or more threads may race to be the
+ * first to initialize the static and handle that case accordingly.
+ */
+static CK_RV prvCryptoGetPkcs11Session( SemaphoreHandle_t * pxSessionLock,
+                                        CK_SESSION_HANDLE * pxSession,
+                                        CK_FUNCTION_LIST_PTR_PTR ppxFunctionList )
+{
+    CK_RV xResult = CKR_OK;
+    CK_C_GetFunctionList pxCkGetFunctionList = NULL;
+    static CK_SESSION_HANDLE xPkcs11Session = 0;
+    static CK_FUNCTION_LIST_PTR pxPkcs11FunctionList = NULL;
+    static StaticSemaphore_t xStaticSemaphore;
+    static SemaphoreHandle_t xSessionLock = NULL;
+    CK_ULONG ulCount = 0;
+    CK_SLOT_ID * pxSlotIds = NULL;
+
+    /* Check if one-time initialization of the lock is needed.*/
+    portENTER_CRITICAL();
+
+    if( NULL == xSessionLock )
+    {
+        xSessionLock = xSemaphoreCreateMutexStatic( &xStaticSemaphore );
+    }
+
+    *pxSessionLock = xSessionLock;
+    portEXIT_CRITICAL();
+
+    /* Check if one-time initialization of the crypto handle is needed.*/
+    xSemaphoreTake( xSessionLock, portMAX_DELAY );
+
+    if( 0 == xPkcs11Session )
+    {
+        /* One-time initialization. */
+
+        /* Ensure that the PKCS#11 module is initialized. We don't keep the
+         * scheduler stopped here, since we don't want to make assumptions about hardware
+         * requirements for accessing a crypto module. */
+
+        xInitializePkcs11Session( &xPkcs11Session );
+    }
+
+    *pxSession = xPkcs11Session;
+    *ppxFunctionList = pxPkcs11FunctionList;
+    xSemaphoreGive( xSessionLock );
+
+
+    return xResult;
+}
+
+CK_RV CRYPTO_ConfigureDRBG( void )
+{
+    CK_RV xResult = CKR_OK;
+
+    #ifdef pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG
+        int lMbedResult = 0;
+
+        /* Initialize the entropy source and DRBG for the CRYPTO module */
+        mbedtls_entropy_init( &xDrbg.xMbedEntropyContext );
+        mbedtls_ctr_drbg_init( &xDrbg.xMbedDrbgCtx );
+
+        if( 0 != mbedtls_ctr_drbg_seed( &xDrbg.xMbedDrbgCtx,
+                                        mbedtls_entropy_func,
+                                        &xDrbg.xMbedEntropyContext,
+                                        NULL,
+                                        0 ) )
+        {
+            xResult = CKR_FUNCTION_FAILED;
+        }
+        else
+        {
+            xDrbg.xIsInitialized = CK_TRUE;
+        }
+    #endif /* ifdef pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG */
+    return xResult;
+}
+
+
+
+CK_RV CRYPTO_GetRandomBytes( CK_BYTE_PTR pRandomBytes,
+                             CK_ULONG length )
+{
+    CK_RV xResult = CKR_OK;
+    int lMbedResult = 0;
+
+
+    if( ( NULL == pRandomBytes ) ||
+        ( length == 0 ) )
+    {
+        xResult = CKR_ARGUMENTS_BAD;
+    }
+
+    #ifdef  pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG
+        if( xResult == CKR_OK )
+        {
+            lMbedResult = mbedtls_ctr_drbg_random( &xDrbg.xMbedDrbgCtx, pRandomBytes, length );
+
+            if( lMbedResult != 0 )
+            {
+                CRYPTO_PRINT( ( "ERROR: DRBG failed %d \r\n", lMbedResult ) );
+                xResult = CKR_FUNCTION_FAILED;
+            }
+        }
+    #else  /* ifdef  pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG */
+        SemaphoreHandle_t xSessionLock = NULL;
+        CK_SESSION_HANDLE xPkcs11Session = 0;
+        CK_FUNCTION_LIST_PTR pxPkcs11FunctionList = NULL;
+
+        xResult = prvCryptoGetPkcs11Session( &xSessionLock,
+                                             &xPkcs11Session,
+                                             &pxPkcs11FunctionList );
+
+        if( xResult == CKR_OK )
+        {
+            xResult = pxPkcs11FunctionList->C_GenerateRandom( xPkcs11Session, pRandomBytes, length );
+        }
+    #endif /* ifdef  pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG */
+
+    return xResult;
 }
 
 /**
