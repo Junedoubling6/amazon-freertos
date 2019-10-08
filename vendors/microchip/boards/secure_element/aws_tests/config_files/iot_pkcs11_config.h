@@ -44,7 +44,7 @@
  * both of those, the user PIN is assumed to be used herein for interoperability
  * purposes only, and not as a security feature.
  */
-#define configPKCS11_DEFAULT_USER_PIN                      "0000"
+#define configPKCS11_DEFAULT_USER_PIN                      "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"
 
 /**
  * @brief Maximum length (in characters) for a PKCS #11 CKA_LABEL
@@ -82,6 +82,14 @@
  * they are accessed via headers compiled into the code.
  */
 #define pkcs11configJITP_CODEVERIFY_ROOT_CERT_SUPPORTED    0
+
+/**
+* @brief    Set to 1 if C_GenerateRandom maintains a DRBG.
+*
+* If C_GenerateRandom does not maintain a DRBG, a DRBG will be
+* maintained by the Amazon FreeRTOS port to improve performance.
+*/
+#define pkcs11configGENERATE_RANDOM_MAINTAINS_DRBG          0
 
 /**
  * @brief The PKCS #11 label for device private key.

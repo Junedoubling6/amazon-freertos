@@ -27,6 +27,7 @@
 #include <Windows.h>
 #include <wincrypt.h>
 #include "mbedtls/entropy.h"
+#include "iot_pkcs11.h"
 
 /*-----------------------------------------------------------*/
 
@@ -35,27 +36,32 @@ int mbedtls_hardware_poll( void * data,
                            size_t len,
                            size_t * olen )
 {
-    int lStatus = MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
-    HCRYPTPROV hProv = 0;
-
-    /* Unferenced parameter. */
-    ( void ) data;
-
-    /*
-     * This is port-specific for the Windows simulator, so just use Crypto API.
-     */
-
-    if( TRUE == CryptAcquireContextA(
-            &hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT ) )
+    CK_RV xResult = CKR_OK;
+    int lMbedResult = MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+    CK_SESSION_HANDLE xSession;
+    CK_FUNCTION_LIST_PTR pxFunctionList;
+    
+    xResult = xInitializePkcs11Session( &xSession );
+    
+    if ( xResult == CKR_OK )
     {
-        if( TRUE == CryptGenRandom( hProv, len, output ) )
-        {
-            lStatus = 0;
-            *olen = len;
-        }
-
-        CryptReleaseContext( hProv, 0 );
+        xResult = C_GetFunctionList( &pxFunctionList );
+    }
+    
+    if ( xResult == CKR_OK )
+    {
+        xResult = pxFunctionList->C_GenerateRandom( xSession, output, len );
     }
 
-    return lStatus;
+    if ( xResult == CKR_OK )
+    {
+        lMbedResult = 0;
+        *olen = len;
+    }
+    else
+    {
+        *olen = 0;
+    }
+
+    return lMbedResult;
 }
